@@ -12,14 +12,23 @@ import sys
 import time
 from pathlib import Path
 
-# Add src to path if running directly
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent))
 
 from number_matcher import NumberMatcher
 from gpio_handler import GPIOHandler
 from api_client import APIClient
-from sip_handler import SIPHandler
+
+# Try PJSIP first, fall back to pyVoIP
+try:
+    from sip_handler_pjsip import SIPHandlerPJSIP as SIPHandler
+    SIP_BACKEND = "pjsip"
+except ImportError:
+    try:
+        from sip_handler import SIPHandler
+        SIP_BACKEND = "pyvoip"
+    except ImportError:
+        SIP_BACKEND = "none"
 
 
 class SIPClientApp:
@@ -61,7 +70,6 @@ class SIPClientApp:
         """Load configuration file."""
         self.config = configparser.ConfigParser()
         
-        # Check multiple locations
         paths = [
             self.config_path,
             Path(__file__).parent.parent / "config.ini",
@@ -74,7 +82,6 @@ class SIPClientApp:
                 print(f"Loaded config from: {path}")
                 return True
         
-        # Create default config
         print(f"Config not found, using defaults")
         self._set_default_config()
         return True
@@ -111,6 +118,7 @@ class SIPClientApp:
     def initialize_components(self):
         """Initialize all components."""
         self.logger.info("Initializing components...")
+        self.logger.info(f"SIP Backend: {SIP_BACKEND}")
         
         # Number Matcher
         self.number_matcher = NumberMatcher()
@@ -138,8 +146,15 @@ class SIPClientApp:
             use_cache_on_failure=self.config.getboolean('CACHE', 'use_cache_on_api_failure', fallback=True),
             on_update=self._on_numbers_updated
         )
+        
         # SIP Handler
         mock_sip = '--mock-sip' in sys.argv
+        
+        if SIP_BACKEND == "none":
+            self.logger.error("No SIP backend available!")
+            self.logger.error("Install pjsua2: bash install_pjsip.sh")
+            self.logger.error("Or pyVoIP: pip install pyVoIP")
+            mock_sip = True
         
         self.sip_handler = SIPHandler(
             server=self.config.get('SIP', 'server', fallback='localhost'),
@@ -173,27 +188,16 @@ class SIPClientApp:
         self._shutdown = True
     
     def run(self) -> int:
-        """
-        Run the application.
-        
-        Returns:
-            Exit code
-        """
-        # Load config
+        """Run the application."""
         if not self.load_config():
             return 1
         
-        # Setup logging
         self.setup_logging()
-        
-        # Display banner
         self._display_banner()
         
-        # Setup signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        # Initialize components
         self.initialize_components()
         
         # Start API client
@@ -201,7 +205,7 @@ class SIPClientApp:
         if not self.api_client.start():
             self.logger.warning("API client failed to fetch initial data")
         
-        time.sleep(1)  # Give time for initial fetch
+        time.sleep(1)
         
         # Show loaded patterns
         patterns = self.number_matcher.get_patterns()
@@ -219,7 +223,6 @@ class SIPClientApp:
             self.api_client.stop()
             return 1
         
-        # Display ready message
         self._display_ready()
         
         # Main loop
@@ -229,24 +232,20 @@ class SIPClientApp:
         except KeyboardInterrupt:
             pass
         
-        # Shutdown
         self._shutdown_components()
-        
         return 0
     
     def _display_banner(self):
-        """Display application banner."""
         print()
         print("╔" + "═" * 58 + "╗")
         print("║" + " " * 58 + "║")
         print("║" + "  SIP CLIENT FOR RASPBERRY PI".center(58) + "║")
-        print("║" + "  Version 1.0.0".center(58) + "║")
+        print("║" + f"  Version 1.0.0 ({SIP_BACKEND.upper()})".center(58) + "║")
         print("║" + " " * 58 + "║")
         print("╚" + "═" * 58 + "╝")
         print()
     
     def _display_ready(self):
-        """Display ready message."""
         print()
         print("╔" + "═" * 58 + "╗")
         print("║" + "  ✅ SYSTEM READY".center(58) + "║")
@@ -257,7 +256,6 @@ class SIPClientApp:
         print()
     
     def _shutdown_components(self):
-        """Shutdown all components."""
         print("\nShutting down...")
         
         if self.sip_handler:
@@ -273,8 +271,6 @@ class SIPClientApp:
 
 
 def main():
-    """Entry point."""
-    # Parse arguments
     config_path = "config.ini"
     
     for arg in sys.argv[1:]:
@@ -287,9 +283,10 @@ def main():
             print("  --config=PATH   Path to config file")
             print("  --mock-sip      Use mock SIP (no real registration)")
             print("  --help          Show this help")
+            print()
+            print(f"SIP Backend: {SIP_BACKEND}")
             return 0
     
-    # Run app
     app = SIPClientApp(config_path)
     return app.run()
 
