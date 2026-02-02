@@ -74,7 +74,6 @@ def register_thread():
         return
     
     try:
-        # Check if already registered
         if not pj.Endpoint.instance().libIsThreadRegistered():
             pj.Endpoint.instance().libRegisterThread(threading.current_thread().name)
             logger.debug(f"Registered thread: {threading.current_thread().name}")
@@ -133,7 +132,6 @@ if PJSUA2_AVAILABLE:
                 logger.info(f"Incoming call from: {caller_id}")
                 
                 # Handle call directly in this thread (PJSIP's thread)
-                # This is safe because we're already in a PJSIP-registered thread
                 self.sip_handler._handle_incoming_call_sync(call, caller_id)
                 
             except Exception as e:
@@ -159,6 +157,7 @@ if PJSUA2_AVAILABLE:
             self.caller_id = ""
             self.answered = False
             self.disconnected = False
+            self.media_active = False
         
         def onCallState(self, prm):
             """Called when call state changes."""
@@ -169,13 +168,24 @@ if PJSUA2_AVAILABLE:
                 if info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
                     logger.info("Call disconnected")
                     self.disconnected = True
+                elif info.state == pj.PJSIP_INV_STATE_CONFIRMED:
+                    logger.info("Call confirmed/connected")
             except Exception as e:
                 logger.error(f"onCallState error: {e}")
         
         def onCallMediaState(self, prm):
             """Called when media state changes."""
             try:
-                logger.debug(f"Media state changed")
+                info = self.getInfo()
+                for mi in info.media:
+                    if mi.type == pj.PJMEDIA_TYPE_AUDIO:
+                        if mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
+                            self.media_active = True
+                            logger.info("Audio media is active")
+                            # Connect to null audio for headless operation
+                            # (audio will just be discarded)
+                        elif mi.status == pj.PJSUA_CALL_MEDIA_NONE:
+                            logger.debug("No audio media")
             except Exception as e:
                 logger.error(f"onCallMediaState error: {e}")
 
@@ -259,22 +269,35 @@ class SIPHandlerPJSIP:
             ep_cfg.uaConfig.userAgent = "SIPClient/1.0 (PJSIP)"
             ep_cfg.uaConfig.maxCalls = 4
             
-            # Thread setting - important!
-            ep_cfg.uaConfig.threadCnt = 0  # No worker threads - we handle in callbacks
+            # Thread setting
+            ep_cfg.uaConfig.threadCnt = 0
             ep_cfg.uaConfig.mainThreadOnly = False
+            
+            # Media config - IMPORTANT for headless operation
+            ep_cfg.medConfig.noVad = True
             
             # Initialize library
             self._endpoint.libInit(ep_cfg)
             logger.info("PJSIP library initialized")
+            
+            # ============================================
+            # FIX 1: Set null audio device for headless operation
+            # ============================================
+            try:
+                self._endpoint.audDevManager().setNullDev()
+                logger.info("Null audio device configured")
+            except Exception as e:
+                logger.warning(f"Could not set null audio device: {e}")
             
             # Create UDP transport
             tp_cfg = pj.TransportConfig()
             tp_cfg.port = 5060
             tp_cfg.boundAddress = ""
             
+            # Set public address for SIP signaling (NAT traversal)
             if self.public_ip and self.public_ip != self.local_ip:
                 tp_cfg.publicAddress = self.public_ip
-                logger.info(f"Set public address to: {self.public_ip}")
+                logger.info(f"SIP transport public address: {self.public_ip}")
             
             self._endpoint.transportCreate(pj.PJSIP_TRANSPORT_UDP, tp_cfg)
             logger.info("UDP transport created")
@@ -299,20 +322,30 @@ class SIPHandlerPJSIP:
             cred.data = self.password
             acc_cfg.sipConfig.authCreds.append(cred)
             
-            # NAT settings
-            acc_cfg.natConfig.contactRewriteUse = 2
+            # ============================================
+            # FIX 2: Better NAT settings
+            # ============================================
+            acc_cfg.natConfig.contactRewriteUse = 1  # Auto-update Contact based on response
             acc_cfg.natConfig.viaRewriteUse = 1
-            acc_cfg.natConfig.sdpNatRewriteUse = 1
+            acc_cfg.natConfig.sdpNatRewriteUse = 2   # Always rewrite SDP with public IP
             acc_cfg.natConfig.sipOutboundUse = 0
             acc_cfg.natConfig.iceEnabled = False
+            acc_cfg.natConfig.turnEnabled = False
             
             if self.public_ip:
                 acc_cfg.natConfig.sipStunUse = 0
                 acc_cfg.natConfig.mediaStunUse = 0
             
-            # Media config
+            # ============================================
+            # FIX 3: RTP/Media config with public IP
+            # ============================================
             acc_cfg.mediaConfig.transportConfig.port = 10000
             acc_cfg.mediaConfig.transportConfig.portRange = 10000
+            
+            # CRITICAL: Set public address for RTP
+            if self.public_ip:
+                acc_cfg.mediaConfig.transportConfig.publicAddress = self.public_ip
+                logger.info(f"RTP transport public address: {self.public_ip}")
             
             # Create and register account
             self._account = MyAccount(self)
@@ -396,14 +429,25 @@ class SIPHandlerPJSIP:
         )
         
         try:
-            # Brief delay before answering (but not too long to block PJSIP)
-            # Use small sleep increments to keep event loop responsive
+            # ============================================
+            # FIX 4: Send 180 Ringing FIRST
+            # ============================================
+            logger.info(f"Call #{call_num}: Sending 180 Ringing")
+            ringing_prm = pj.CallOpParam()
+            ringing_prm.statusCode = 180
+            ringing_prm.reason = "Ringing"
+            call.answer(ringing_prm)
+            
+            # Process events to ensure 180 is sent
+            if self._endpoint:
+                self._endpoint.libHandleEvents(50)
+            
+            # Wait before answering (simulate ring time)
             delay_remaining = self.answer_delay
             while delay_remaining > 0 and not call.disconnected:
                 sleep_time = min(0.1, delay_remaining)
                 time.sleep(sleep_time)
                 delay_remaining -= sleep_time
-                # Keep processing events
                 if self._endpoint:
                     self._endpoint.libHandleEvents(10)
             
@@ -413,17 +457,37 @@ class SIPHandlerPJSIP:
                 self._call_history.append(call_info)
                 return
             
-            # Answer the call
-            logger.info(f"Call #{call_num}: Answering")
-            prm = pj.CallOpParam()
-            prm.statusCode = 200
-            call.answer(prm)
+            # ============================================
+            # FIX 5: Answer with 200 OK
+            # ============================================
+            logger.info(f"Call #{call_num}: Answering with 200 OK")
+            answer_prm = pj.CallOpParam()
+            answer_prm.statusCode = 200
+            answer_prm.reason = "OK"
+            call.answer(answer_prm)
             call.answered = True
             
             call_info.state = CallState.ANSWERED
             self._display_call_answered()
             
-            # Wait before hanging up
+            # Process events to ensure 200 OK is sent and ACK received
+            if self._endpoint:
+                self._endpoint.libHandleEvents(100)
+            
+            # Wait for media to become active (with timeout)
+            media_timeout = 2.0
+            while media_timeout > 0 and not call.media_active and not call.disconnected:
+                time.sleep(0.1)
+                media_timeout -= 0.1
+                if self._endpoint:
+                    self._endpoint.libHandleEvents(10)
+            
+            if call.media_active:
+                logger.info(f"Call #{call_num}: Media established")
+            else:
+                logger.warning(f"Call #{call_num}: Media not established (continuing anyway)")
+            
+            # Wait the hangup_delay (call is connected during this time)
             delay_remaining = self.hangup_delay
             while delay_remaining > 0 and not call.disconnected:
                 sleep_time = min(0.1, delay_remaining)
@@ -435,10 +499,16 @@ class SIPHandlerPJSIP:
             # Hang up if not already disconnected
             if not call.disconnected:
                 logger.info(f"Call #{call_num}: Hanging up")
-                call.hangup(pj.CallOpParam())
+                hangup_prm = pj.CallOpParam()
+                hangup_prm.statusCode = 200
+                call.hangup(hangup_prm)
             
             call_info.state = CallState.ENDED
             self._display_call_ended()
+            
+            # Give time for BYE to be sent
+            if self._endpoint:
+                self._endpoint.libHandleEvents(100)
             
             # Check if caller is valid
             if self.check_number:
@@ -510,7 +580,7 @@ class SIPHandlerPJSIP:
         print("╠" + "═" * 48 + "╣")
     
     def _display_call_answered(self):
-        print("║" + "  ✓ ANSWERED".center(48) + "║")
+        print("║" + "  ✓ ANSWERED (200 OK sent)".center(48) + "║")
     
     def _display_call_ended(self):
         print("║" + "  ✓ HUNG UP".center(48) + "║")
@@ -649,7 +719,6 @@ def main():
     
     def check_number(number):
         normalized = number.replace('+', '').replace(' ', '').replace('-', '')
-        # Remove leading 0 for UK numbers
         if normalized.startswith('0') and len(normalized) == 11:
             normalized = '44' + normalized[1:]
         if normalized.startswith("44") or normalized.startswith("216"):
@@ -676,7 +745,7 @@ def main():
         print("\nWaiting for calls... Press Ctrl+C to stop\n")
         try:
             while True:
-                sip.poll()  # Important: keep polling!
+                sip.poll()
                 time.sleep(0.1)
         except KeyboardInterrupt:
             pass
