@@ -1,0 +1,10 @@
+services:
+  sip-client:
+    build: .
+    network_mode: host
+    volumes:
+      - ./src:/app/src
+      - ./config.ini:/app/config.ini
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python /app/src/main.py

@@ -1,0 +1,17 @@
+# SIP/VoIP
+pyVoIP
+
+# HTTP client
+requests
+
+# GPIO (mock on non-Pi)
+gpiozero
+
+# Mock API server
+Flask
+
+# Testing
+pytest
+
+# Utilities
+python-dotenv
