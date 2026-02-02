@@ -61,6 +61,28 @@ def get_local_ip() -> str:
         return "0.0.0.0"
 
 
+# Thread-local storage for pjsip thread registration
+_thread_registered = threading.local()
+
+
+def register_thread():
+    """Register current thread with PJSIP if not already registered."""
+    if not PJSUA2_AVAILABLE:
+        return
+    
+    if getattr(_thread_registered, 'registered', False):
+        return
+    
+    try:
+        # Check if already registered
+        if not pj.Endpoint.instance().libIsThreadRegistered():
+            pj.Endpoint.instance().libRegisterThread(threading.current_thread().name)
+            logger.debug(f"Registered thread: {threading.current_thread().name}")
+        _thread_registered.registered = True
+    except Exception as e:
+        logger.warning(f"Thread registration failed: {e}")
+
+
 # Only define these classes if pjsua2 is available
 if PJSUA2_AVAILABLE:
     
@@ -68,7 +90,6 @@ if PJSUA2_AVAILABLE:
         """Custom log writer for pjsua2."""
         
         def write(self, entry):
-            # Filter out noisy logs
             msg = entry.msg.strip()
             if msg and entry.level <= 3:
                 logger.debug(f"PJSIP: {msg}")
@@ -110,7 +131,10 @@ if PJSUA2_AVAILABLE:
                 self.calls[prm.callId] = call
                 
                 logger.info(f"Incoming call from: {caller_id}")
-                self.sip_handler._handle_incoming_call(call, caller_id)
+                
+                # Handle call directly in this thread (PJSIP's thread)
+                # This is safe because we're already in a PJSIP-registered thread
+                self.sip_handler._handle_incoming_call_sync(call, caller_id)
                 
             except Exception as e:
                 logger.error(f"onIncomingCall error: {e}")
@@ -120,7 +144,6 @@ if PJSUA2_AVAILABLE:
         def _extract_caller_id(self, remote_uri: str) -> str:
             """Extract phone number from SIP URI."""
             import re
-            # Parse sip:number@host or "Name" <sip:number@host>
             match = re.search(r'sip:([^@>]+)', remote_uri)
             if match:
                 return match.group(1)
@@ -135,6 +158,7 @@ if PJSUA2_AVAILABLE:
             self.sip_handler = sip_handler
             self.caller_id = ""
             self.answered = False
+            self.disconnected = False
         
         def onCallState(self, prm):
             """Called when call state changes."""
@@ -144,14 +168,14 @@ if PJSUA2_AVAILABLE:
                 
                 if info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
                     logger.info("Call disconnected")
+                    self.disconnected = True
             except Exception as e:
                 logger.error(f"onCallState error: {e}")
         
         def onCallMediaState(self, prm):
             """Called when media state changes."""
             try:
-                info = self.getInfo()
-                logger.debug(f"Media state changed for call")
+                logger.debug(f"Media state changed")
             except Exception as e:
                 logger.error(f"onCallMediaState error: {e}")
 
@@ -202,7 +226,10 @@ class SIPHandlerPJSIP:
         self._valid_call_count = 0
         self._call_history: list = []
         
-        # Check if pjsua2 is available
+        # Pending callbacks to execute in main thread
+        self._pending_gpio_callbacks = []
+        self._gpio_lock = threading.Lock()
+        
         self.mock_mode = mock_mode or not PJSUA2_AVAILABLE
         
         if not PJSUA2_AVAILABLE and not mock_mode:
@@ -223,7 +250,7 @@ class SIPHandlerPJSIP:
             # Configure endpoint
             ep_cfg = pj.EpConfig()
             
-            # Log config - reduce verbosity
+            # Log config
             ep_cfg.logConfig.level = 4
             ep_cfg.logConfig.consoleLevel = 3
             ep_cfg.logConfig.msgLogging = 1
@@ -232,6 +259,10 @@ class SIPHandlerPJSIP:
             ep_cfg.uaConfig.userAgent = "SIPClient/1.0 (PJSIP)"
             ep_cfg.uaConfig.maxCalls = 4
             
+            # Thread setting - important!
+            ep_cfg.uaConfig.threadCnt = 0  # No worker threads - we handle in callbacks
+            ep_cfg.uaConfig.mainThreadOnly = False
+            
             # Initialize library
             self._endpoint.libInit(ep_cfg)
             logger.info("PJSIP library initialized")
@@ -239,10 +270,8 @@ class SIPHandlerPJSIP:
             # Create UDP transport
             tp_cfg = pj.TransportConfig()
             tp_cfg.port = 5060
-            # Bind to all interfaces - critical for NAT
             tp_cfg.boundAddress = ""
             
-            # For cloud environments, we might need to set public address
             if self.public_ip and self.public_ip != self.local_ip:
                 tp_cfg.publicAddress = self.public_ip
                 logger.info(f"Set public address to: {self.public_ip}")
@@ -261,29 +290,27 @@ class SIPHandlerPJSIP:
             acc_cfg.regConfig.timeoutSec = 120
             acc_cfg.regConfig.retryIntervalSec = 30
             
-            # Add credentials
+            # Credentials
             cred = pj.AuthCredInfo()
             cred.scheme = "digest"
             cred.realm = "*"
             cred.username = self.username
-            cred.dataType = 0  # Plain text password
+            cred.dataType = 0
             cred.data = self.password
             acc_cfg.sipConfig.authCreds.append(cred)
             
-            # NAT settings - use integers, not constants
-            # contactRewriteUse: 0=no, 1=yes, 2=always
-            acc_cfg.natConfig.contactRewriteUse = 2  # Always rewrite
-            acc_cfg.natConfig.viaRewriteUse = 1      # Rewrite Via
-            acc_cfg.natConfig.sdpNatRewriteUse = 1   # Rewrite SDP
-            acc_cfg.natConfig.sipOutboundUse = 0     # Don't use outbound
-            acc_cfg.natConfig.iceEnabled = False     # No ICE needed
+            # NAT settings
+            acc_cfg.natConfig.contactRewriteUse = 2
+            acc_cfg.natConfig.viaRewriteUse = 1
+            acc_cfg.natConfig.sdpNatRewriteUse = 1
+            acc_cfg.natConfig.sipOutboundUse = 0
+            acc_cfg.natConfig.iceEnabled = False
             
-            # If we have a public IP, use it
             if self.public_ip:
-                acc_cfg.natConfig.sipStunUse = 0     # Don't use STUN
-                acc_cfg.natConfig.mediaStunUse = 0   # Don't use STUN for media
+                acc_cfg.natConfig.sipStunUse = 0
+                acc_cfg.natConfig.mediaStunUse = 0
             
-            # Media config - RTP ports
+            # Media config
             acc_cfg.mediaConfig.transportConfig.port = 10000
             acc_cfg.mediaConfig.transportConfig.portRange = 10000
             
@@ -296,10 +323,9 @@ class SIPHandlerPJSIP:
             self._running = True
             timeout = 15
             while timeout > 0 and not self._registered and not self._reg_failed_reason:
-                time.sleep(0.5)
-                timeout -= 0.5
-                # Keep event loop running
-                self._endpoint.libHandleEvents(100)
+                time.sleep(0.1)
+                timeout -= 0.1
+                self._endpoint.libHandleEvents(50)
             
             if self._registered:
                 self._display_registered()
@@ -317,10 +343,8 @@ class SIPHandlerPJSIP:
             import traceback
             logger.error(traceback.format_exc())
             
-            # Clean up on failure
             self._cleanup_pjsip()
             
-            # Fall back to mock mode
             print(f"\n❌ PJSIP Error: {e}")
             print("Falling back to mock mode...\n")
             self.mock_mode = True
@@ -354,8 +378,11 @@ class SIPHandlerPJSIP:
         """Called when registration fails."""
         self._reg_failed_reason = reason
     
-    def _handle_incoming_call(self, call, caller_id: str):
-        """Handle incoming SIP call."""
+    def _handle_incoming_call_sync(self, call, caller_id: str):
+        """
+        Handle incoming SIP call synchronously.
+        This runs in PJSIP's callback thread, so all pjsua2 calls are safe.
+        """
         self._call_count += 1
         call_num = self._call_count
         
@@ -368,19 +395,23 @@ class SIPHandlerPJSIP:
             timestamp=time.time()
         )
         
-        # Handle in background thread
-        thread = threading.Thread(
-            target=self._process_call,
-            args=(call, call_info, call_num),
-            daemon=True
-        )
-        thread.start()
-    
-    def _process_call(self, call, call_info: CallInfo, call_num: int):
-        """Process the call (answer, check, hangup)."""
         try:
-            # Wait before answering
-            time.sleep(self.answer_delay)
+            # Brief delay before answering (but not too long to block PJSIP)
+            # Use small sleep increments to keep event loop responsive
+            delay_remaining = self.answer_delay
+            while delay_remaining > 0 and not call.disconnected:
+                sleep_time = min(0.1, delay_remaining)
+                time.sleep(sleep_time)
+                delay_remaining -= sleep_time
+                # Keep processing events
+                if self._endpoint:
+                    self._endpoint.libHandleEvents(10)
+            
+            if call.disconnected:
+                logger.info(f"Call #{call_num}: Caller hung up before answer")
+                call_info.state = CallState.ENDED
+                self._call_history.append(call_info)
+                return
             
             # Answer the call
             logger.info(f"Call #{call_num}: Answering")
@@ -393,18 +424,25 @@ class SIPHandlerPJSIP:
             self._display_call_answered()
             
             # Wait before hanging up
-            time.sleep(self.hangup_delay)
+            delay_remaining = self.hangup_delay
+            while delay_remaining > 0 and not call.disconnected:
+                sleep_time = min(0.1, delay_remaining)
+                time.sleep(sleep_time)
+                delay_remaining -= sleep_time
+                if self._endpoint:
+                    self._endpoint.libHandleEvents(10)
             
-            # Hang up
-            logger.info(f"Call #{call_num}: Hanging up")
-            call.hangup(pj.CallOpParam())
+            # Hang up if not already disconnected
+            if not call.disconnected:
+                logger.info(f"Call #{call_num}: Hanging up")
+                call.hangup(pj.CallOpParam())
             
             call_info.state = CallState.ENDED
             self._display_call_ended()
             
             # Check if caller is valid
             if self.check_number:
-                is_valid, pattern = self.check_number(call_info.caller_id)
+                is_valid, pattern = self.check_number(caller_id)
                 call_info.is_valid = is_valid
                 call_info.matched_pattern = pattern
                 
@@ -412,8 +450,10 @@ class SIPHandlerPJSIP:
                     self._valid_call_count += 1
                     self._display_valid_caller(pattern)
                     
+                    # Queue GPIO callback for main thread
                     if self.on_valid_call:
-                        self.on_valid_call(call_info.caller_id)
+                        with self._gpio_lock:
+                            self._pending_gpio_callbacks.append(caller_id)
                 else:
                     self._display_invalid_caller()
             
@@ -422,11 +462,36 @@ class SIPHandlerPJSIP:
             import traceback
             logger.error(traceback.format_exc())
             try:
-                call.hangup(pj.CallOpParam())
+                if not call.disconnected:
+                    call.hangup(pj.CallOpParam())
             except:
                 pass
         finally:
             self._call_history.append(call_info)
+    
+    def process_pending_callbacks(self):
+        """Process any pending GPIO callbacks (call from main thread)."""
+        with self._gpio_lock:
+            callbacks = self._pending_gpio_callbacks[:]
+            self._pending_gpio_callbacks.clear()
+        
+        for caller_id in callbacks:
+            if self.on_valid_call:
+                try:
+                    self.on_valid_call(caller_id)
+                except Exception as e:
+                    logger.error(f"GPIO callback error: {e}")
+    
+    def poll(self):
+        """Poll for events - call regularly from main loop."""
+        if self._endpoint and not self.mock_mode:
+            try:
+                self._endpoint.libHandleEvents(100)
+            except:
+                pass
+        
+        # Process any pending GPIO callbacks
+        self.process_pending_callbacks()
     
     def _start_mock(self) -> bool:
         """Start in mock mode."""
@@ -584,6 +649,9 @@ def main():
     
     def check_number(number):
         normalized = number.replace('+', '').replace(' ', '').replace('-', '')
+        # Remove leading 0 for UK numbers
+        if normalized.startswith('0') and len(normalized) == 11:
+            normalized = '44' + normalized[1:]
         if normalized.startswith("44") or normalized.startswith("216"):
             if normalized.startswith("44"):
                 return True, "44*"
@@ -608,10 +676,8 @@ def main():
         print("\nWaiting for calls... Press Ctrl+C to stop\n")
         try:
             while True:
-                time.sleep(1)
-                # Keep pjsip event loop running
-                if sip._endpoint and not sip.mock_mode:
-                    sip._endpoint.libHandleEvents(100)
+                sip.poll()  # Important: keep polling!
+                time.sleep(0.1)
         except KeyboardInterrupt:
             pass
         sip.stop()

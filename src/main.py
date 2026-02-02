@@ -228,6 +228,9 @@ class SIPClientApp:
         # Main loop
         try:
             while not self._shutdown:
+                # Poll SIP handler for events and GPIO callbacks
+                if self.sip_handler:
+                    self.sip_handler.poll() 
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
