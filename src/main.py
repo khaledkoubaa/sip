@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SIP Client for Raspberry Pi
-Main application entry point.
+Main application entry point - DEBUG VERSION
 """
 
 import configparser
@@ -19,23 +19,16 @@ from number_matcher import NumberMatcher
 from gpio_handler import GPIOHandler
 from api_client import APIClient
 
-# Try PJSIP first, fall back to pyVoIP
-try:
-    from sip_handler_pjsip import SIPHandlerPJSIP as SIPHandler
-    SIP_BACKEND = "pjsip"
-except ImportError:
-    try:
-        from sip_handler import SIPHandler
-        SIP_BACKEND = "pyvoip"
-    except ImportError:
-        SIP_BACKEND = "none"
+from sip_handler_pjsip import SIPHandlerPJSIP as SIPHandler
+SIP_BACKEND = "pjsip"
 
 
 class SIPClientApp:
     """Main application class."""
     
-    def __init__(self, config_path: str = "config.ini"):
+    def __init__(self, config_path: str = "config.ini", debug: bool = False):
         self.config_path = config_path
+        self.debug = debug
         self.config = None
         self.logger = None
         
@@ -48,7 +41,12 @@ class SIPClientApp:
     
     def setup_logging(self):
         """Configure logging."""
-        level = self.config.get('LOGGING', 'level', fallback='INFO')
+        # Determine log level
+        if self.debug:
+            level = "DEBUG"
+        else:
+            level = self.config.get('LOGGING', 'level', fallback='INFO')
+        
         log_file = self.config.get('LOGGING', 'file', fallback='')
         
         handlers = [logging.StreamHandler()]
@@ -58,13 +56,27 @@ class SIPClientApp:
             except Exception as e:
                 print(f"Warning: Could not create log file: {e}")
         
+        # Enhanced format for debugging
+        if self.debug:
+            log_format = '%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s'
+            date_format = '%H:%M:%S'
+        else:
+            log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            date_format = None
+        
         logging.basicConfig(
             level=getattr(logging, level.upper(), logging.INFO),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            format=log_format,
+            datefmt=date_format,
             handlers=handlers
         )
         
         self.logger = logging.getLogger(__name__)
+        
+        # Also configure PJSIP logger
+        if self.debug:
+            pjsip_logger = logging.getLogger("pjsip")
+            pjsip_logger.setLevel(logging.DEBUG)
     
     def load_config(self) -> bool:
         """Load configuration file."""
@@ -119,6 +131,7 @@ class SIPClientApp:
         """Initialize all components."""
         self.logger.info("Initializing components...")
         self.logger.info(f"SIP Backend: {SIP_BACKEND}")
+        self.logger.info(f"Debug mode: {self.debug}")
         
         # Number Matcher
         self.number_matcher = NumberMatcher()
@@ -152,9 +165,10 @@ class SIPClientApp:
         
         if SIP_BACKEND == "none":
             self.logger.error("No SIP backend available!")
-            self.logger.error("Install pjsua2: bash install_pjsip.sh")
-            self.logger.error("Or pyVoIP: pip install pyVoIP")
             mock_sip = True
+        
+        # Use debug level 5 if in debug mode
+        debug_level = 5 if self.debug else 3
         
         self.sip_handler = SIPHandler(
             server=self.config.get('SIP', 'server', fallback='localhost'),
@@ -165,7 +179,8 @@ class SIPClientApp:
             hangup_delay=self.config.getfloat('SIP', 'hangup_delay_seconds', fallback=2),
             check_number=self._check_number,
             on_valid_call=self._on_valid_call,
-            mock_mode=mock_sip
+            mock_mode=mock_sip,
+            debug_level=debug_level
         )
     
     def _on_numbers_updated(self, numbers):
@@ -228,10 +243,9 @@ class SIPClientApp:
         # Main loop
         try:
             while not self._shutdown:
-                # Poll SIP handler for events and GPIO callbacks
                 if self.sip_handler:
-                    self.sip_handler.poll() 
-                time.sleep(1)
+                    self.sip_handler.poll()
+                time.sleep(0.1)  # Poll more frequently for responsiveness
         except KeyboardInterrupt:
             pass
         
@@ -239,11 +253,12 @@ class SIPClientApp:
         return 0
     
     def _display_banner(self):
+        mode = "DEBUG" if self.debug else "NORMAL"
         print()
         print("╔" + "═" * 58 + "╗")
         print("║" + " " * 58 + "║")
         print("║" + "  SIP CLIENT FOR RASPBERRY PI".center(58) + "║")
-        print("║" + f"  Version 1.0.0 ({SIP_BACKEND.upper()})".center(58) + "║")
+        print("║" + f"  Version 1.0.0 ({SIP_BACKEND.upper()}) - {mode} MODE".center(58) + "║")
         print("║" + " " * 58 + "║")
         print("╚" + "═" * 58 + "╝")
         print()
@@ -275,22 +290,26 @@ class SIPClientApp:
 
 def main():
     config_path = "config.ini"
+    debug = False
     
     for arg in sys.argv[1:]:
         if arg.startswith("--config="):
             config_path = arg.split("=", 1)[1]
+        elif arg == "--debug" or arg == "-d":
+            debug = True
         elif arg == "--help":
             print("Usage: python main.py [options]")
             print()
             print("Options:")
             print("  --config=PATH   Path to config file")
+            print("  --debug, -d     Enable debug mode (verbose logging)")
             print("  --mock-sip      Use mock SIP (no real registration)")
             print("  --help          Show this help")
             print()
             print(f"SIP Backend: {SIP_BACKEND}")
             return 0
     
-    app = SIPClientApp(config_path)
+    app = SIPClientApp(config_path, debug=debug)
     return app.run()
 
 
