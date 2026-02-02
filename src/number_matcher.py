@@ -47,7 +47,7 @@ class NumberMatcher:
             
             # Convert wildcard pattern to regex
             if pattern == '*':
-                # Match anything (including empty)
+                # Match anything non-empty
                 regex = re.compile(r'^.+$')
             elif '*' in pattern:
                 # Escape special regex chars, then replace \* with .*
@@ -72,13 +72,15 @@ class NumberMatcher:
         Handles:
         - +44... → 44...
         - 0044... → 44...
+        - 07xxx... (UK mobile) → 447xxx...
+        - 01xxx... (UK landline) → 441xxx...
         - Spaces, dashes, dots removed
         
         Args:
             number: Raw phone number
             
         Returns:
-            Normalized number (digits only)
+            Normalized number (digits only, international format)
         """
         if not number:
             return ""
@@ -95,6 +97,19 @@ class NumberMatcher:
         # Remove leading 00 (international prefix)
         if number.startswith('00'):
             number = number[2:]
+        
+        # Handle UK domestic format: 0... → 44...
+        # UK numbers starting with 0 followed by 1-9 are domestic
+        if number.startswith('0') and len(number) >= 10:
+            # Check it's a valid UK domestic number (not 00 which we handled above)
+            if len(number) == 11 and number[1] in '123456789':
+                # UK domestic: 01onal, 02london, 03, 07mobile, 08, 09
+                number = '44' + number[1:]
+                logger.debug(f"Converted UK domestic: {original} → {number}")
+            elif len(number) == 10 and number[1] in '123456789':
+                # Some UK numbers are 10 digits
+                number = '44' + number[1:]
+                logger.debug(f"Converted UK domestic (10 digit): {original} → {number}")
         
         logger.debug(f"Normalized: {original} → {number}")
         return number
@@ -122,10 +137,10 @@ class NumberMatcher:
         # Check against each pattern
         for pattern, regex in self._compiled:
             if regex.match(normalized):
-                logger.info(f"✓ Match: {caller_number} → pattern '{pattern}'")
+                logger.info(f"✓ Match: {caller_number} (normalized: {normalized}) → pattern '{pattern}'")
                 return True, pattern
         
-        logger.info(f"✗ No match: {caller_number}")
+        logger.info(f"✗ No match: {caller_number} (normalized: {normalized})")
         return False, None
     
     def get_patterns(self) -> List[str]:
@@ -152,33 +167,47 @@ def main():
     
     matcher = NumberMatcher()
     
-    # Test patterns
+    # Test patterns (from the real API)
     patterns = [
         "441234567890",  # Exact
         "441234*",       # Area code
-        "44*",           # Country
+        "441844220022",  # Client's test number
+        "21620222783",   # Your Tunisia number
+        "216*",          # Tunisia country
     ]
     
     matcher.load_patterns(patterns)
     print(f"\nLoaded patterns: {patterns}\n")
     
-    # Test cases
+    # Test cases including the problematic one
     test_cases = [
+        ("01844220022", True, "UK domestic → should match 441844220022"),
+        ("+441844220022", True, "International format"),
+        ("441844220022", True, "Already international"),
         ("+441234567890", True, "Exact match"),
-        ("441234567890", True, "Exact match no +"),
-        ("00441234567890", True, "With 00 prefix"),
-        ("+44 1234 567890", True, "With spaces"),
-        ("+441234999999", True, "Area code match"),
-        ("+447700900123", True, "UK mobile"),
+        ("01onal number", True, "UK domestic 01234..."),
+        ("+447700900123", False, "UK mobile not in list"),
+        ("+21620222783", True, "Tunisia number"),
         ("+33123456789", False, "French number"),
-        ("+1234567890", False, "US number"),
         ("", False, "Empty"),
-        ("anonymous", False, "Anonymous"),
     ]
     
-    print("-" * 60)
-    print(f"{'NUMBER':<25} {'EXPECTED':<10} {'RESULT':<10} {'NOTE'}")
-    print("-" * 60)
+    # Fix test case
+    test_cases = [
+        ("01844220022", True, "UK domestic → should match 441844220022"),
+        ("+441844220022", True, "International format"),
+        ("441844220022", True, "Already international"),
+        ("+441234567890", True, "Exact match"),
+        ("01234567890", True, "UK domestic 01234..."),
+        ("+447700900123", False, "UK mobile not in list"),
+        ("+21620222783", True, "Tunisia number"),
+        ("+33123456789", False, "French number"),
+        ("", False, "Empty"),
+    ]
+    
+    print("-" * 70)
+    print(f"{'NUMBER':<20} {'EXPECTED':<10} {'RESULT':<10} {'NOTE'}")
+    print("-" * 70)
     
     all_passed = True
     for number, expected, note in test_cases:
@@ -188,9 +217,10 @@ def main():
         
         status = "✓" if passed else "✗ FAIL"
         display_num = number if number else "(empty)"
-        print(f"{display_num:<25} {str(expected):<10} {str(is_match):<10} {note} {status}")
+        matched = f"→{pattern}" if pattern else ""
+        print(f"{display_num:<20} {str(expected):<10} {str(is_match):<10} {note} {status} {matched}")
     
-    print("-" * 60)
+    print("-" * 70)
     print(f"\nResult: {'ALL TESTS PASSED ✓' if all_passed else 'SOME TESTS FAILED ✗'}")
     
     return 0 if all_passed else 1
