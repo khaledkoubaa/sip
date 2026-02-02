@@ -10,6 +10,9 @@ def get_public_ip():
     except:
         return None
 
+from debug_sip import get_local_ip
+local_ip = get_local_ip()
+
 def main():
     print("\n" + "="*60)
     print("SIP DEBUG - Using Public IP")
